@@ -161,46 +161,78 @@ public class QuorumPeerMain {
         try {
             ServerMetrics.metricsProviderInitialized(metricsProvider);
             ProviderRegistry.initialize();
+            // 服务端连接管理
             ServerCnxnFactory cnxnFactory = null;
             ServerCnxnFactory secureCnxnFactory = null;
 
             if (config.getClientPortAddress() != null) {
+                // 这里会查询配置 “zookeeper.serverCnxnFactory”，没有的话，就用 NIOServerCnxnFactory
                 cnxnFactory = ServerCnxnFactory.createFactory();
+                // 这里设置 NIOServerCnxnFactory 管理服务端口的数据接收，
+                // 创建n个selector处理数据异步接收
+                // n = (jvm 能用到的系统核心线程数 / 2) 的平方根取整 <最小值默认是1>
                 cnxnFactory.configure(config.getClientPortAddress(), config.getMaxClientCnxns(), config.getClientPortListenBacklog(), false);
             }
 
+            // 并未使用secure，所以这里没有执行
             if (config.getSecureClientPortAddress() != null) {
                 secureCnxnFactory = ServerCnxnFactory.createFactory();
                 secureCnxnFactory.configure(config.getSecureClientPortAddress(), config.getMaxClientCnxns(), config.getClientPortListenBacklog(), true);
             }
 
+            // 这里主要是new了一个QuorumPeer，并且开启了这个zkServer的admin端口
+            // (默认通过 org.apache.zookeeper.server.admin.JettyAdminServer 实现)
+            // admin端通过restful请求进行server的查看或其他操作
+            // 例如：http://localhost:8080/commands/stat
+            // quorum.auth.enableSasl，如果没有设置这个配置，或设置为false，
+            // admin是没有权限校验的
             quorumPeer = getQuorumPeer();
+
+            // 设置snapshot与日志的文件管理工厂
             quorumPeer.setTxnFactory(new FileTxnSnapLog(config.getDataLogDir(), config.getDataDir()));
+            // 是否启用本地session管理，session负责client与server的会话管理
             quorumPeer.enableLocalSessions(config.areLocalSessionsEnabled());
             quorumPeer.enableLocalSessionsUpgrading(config.isLocalSessionsUpgradingEnabled());
             //quorumPeer.setQuorumPeers(config.getAllMembers());
+
+            // 设置选举方法，目前默认都是3，就是快速选举
             quorumPeer.setElectionType(config.getElectionAlg());
+            // 当前serverId
             quorumPeer.setMyid(config.getServerId());
+            // 默认2秒，心跳
             quorumPeer.setTickTime(config.getTickTime());
+            // 2倍tick time
             quorumPeer.setMinSessionTimeout(config.getMinSessionTimeout());
+            // 20倍tick time
             quorumPeer.setMaxSessionTimeout(config.getMaxSessionTimeout());
+            // 集群中，初始连接时，LEADER与FOLLOWER的最大容忍心跳次数，默认10
             quorumPeer.setInitLimit(config.getInitLimit());
+            // 集群中，同步连接时，LEADER与FOLLOWER的最大容忍心跳次数，默认5
             quorumPeer.setSyncLimit(config.getSyncLimit());
             quorumPeer.setConnectToLearnerMasterLimit(config.getConnectToLearnerMasterLimit());
             quorumPeer.setObserverMasterPort(config.getObserverMasterPort());
+            // zk的配置相对路径
             quorumPeer.setConfigFileName(config.getConfigFilename());
             quorumPeer.setClientPortListenBacklog(config.getClientPortListenBacklog());
+            // 就是上面设置的snapshot文件，作为zkDB的初始化数据(会根据epoch判断是否使用这个本地缓存版本)
             quorumPeer.setZKDatabase(new ZKDatabase(quorumPeer.getTxnFactory()));
+            // 设置majority群组，false表示是否将major群组回写到配置文件中
             quorumPeer.setQuorumVerifier(config.getQuorumVerifier(), false);
+            // 最近一次的major群组，config如果设置了动态配置文件，这里的最近一次群组可能不为null
             if (config.getLastSeenQuorumVerifier() != null) {
                 quorumPeer.setLastSeenQuorumVerifier(config.getLastSeenQuorumVerifier(), false);
             }
+            // 配置zkDB，将集群中的servers放入 /zookeeper/config 节点
             quorumPeer.initConfigInZKDatabase();
+            // 将上面创建的 NIOServerCnxnFactory 设置到quorumPeer中
             quorumPeer.setCnxnFactory(cnxnFactory);
             quorumPeer.setSecureCnxnFactory(secureCnxnFactory);
+            // 默认是不使用https协议，这里默认是false
             quorumPeer.setSslQuorum(config.isSslQuorum());
             quorumPeer.setUsePortUnification(config.shouldUsePortUnification());
+            // 设置本server在集群中的类别：参与选举(默认)/不参与
             quorumPeer.setLearnerType(config.getPeerType());
+            // 设置是否是同步请求（默认同步）
             quorumPeer.setSyncEnabled(config.getSyncEnabled());
             quorumPeer.setQuorumListenOnAllIPs(config.getQuorumListenOnAllIPs());
             if (config.sslQuorumReloadCertFiles) {
@@ -210,6 +242,7 @@ public class QuorumPeerMain {
             quorumPeer.setMultiAddressReachabilityCheckEnabled(config.isMultiAddressReachabilityCheckEnabled());
             quorumPeer.setMultiAddressReachabilityCheckTimeoutMs(config.getMultiAddressReachabilityCheckTimeoutMs());
 
+            // 是否启用简单任何安全协议，默认是false
             // sets quorum sasl authentication configurations
             quorumPeer.setQuorumSaslEnabled(config.quorumEnableSasl);
             if (quorumPeer.isQuorumSaslAuthEnabled()) {
@@ -219,15 +252,21 @@ public class QuorumPeerMain {
                 quorumPeer.setQuorumServerLoginContext(config.quorumServerLoginContext);
                 quorumPeer.setQuorumLearnerLoginContext(config.quorumLearnerLoginContext);
             }
+            // 集群内，各server间进行连接请求时，使用异步方式处理连接的线程池的最大线程数
+            // 默认值是20，当设定值大于20时，采用设定值
+            // 只用当 quorumSaslAuthEnabled 为true时，才有用；默认不启用sasl
             quorumPeer.setQuorumCnxnThreadsSize(config.quorumCnxnThreadsSize);
+            // 初始化 quorum 的 auth server & learner
             quorumPeer.initialize();
 
             if (config.jvmPauseMonitorToRun) {
                 quorumPeer.setJvmPauseMonitor(new JvmPauseMonitor(config));
             }
 
+            // 启动当前server（这里是重点）
             quorumPeer.start();
             ZKAuditProvider.addZKStartStopAuditLog();
+            // 保持主线程等待 quorumPeer 线程完成后，才完成
             quorumPeer.join();
         } catch (InterruptedException e) {
             // warn, but generally this is ok

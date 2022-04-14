@@ -134,6 +134,8 @@ public class QuorumMaj implements QuorumVerifier {
     }
 
     /**
+     * 无权重组，只需要比对投票次数，与投票组总数即可，是否过半
+     *
      * Verifies if a set is a majority. Assumes that ackSet contains acks only
      * from votingMembers
      */

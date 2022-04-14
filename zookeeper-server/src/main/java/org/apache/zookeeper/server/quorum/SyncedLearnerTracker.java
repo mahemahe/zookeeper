@@ -33,6 +33,7 @@ public class SyncedLearnerTracker {
     public boolean addAck(Long sid) {
         boolean change = false;
         for (QuorumVerifierAcksetPair qvAckset : qvAcksetPairs) {
+            // 判断sid是否在当前选举组，在的话，增加投票
             if (qvAckset.getQuorumVerifier().getVotingMembers().containsKey(sid)) {
                 qvAckset.getAckset().add(sid);
                 change = true;
@@ -52,6 +53,8 @@ public class SyncedLearnerTracker {
 
     public boolean hasAllQuorums() {
         for (QuorumVerifierAcksetPair qvAckset : qvAcksetPairs) {
+
+            // 有一组选举组没通过，就不算通过（默认使用org.apache.zookeeper.server.quorum.flexible.QuorumMaj，无权重组）
             if (!qvAckset.getQuorumVerifier().containsQuorum(qvAckset.getAckset())) {
                 return false;
             }

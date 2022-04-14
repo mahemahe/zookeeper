@@ -236,23 +236,35 @@ public class QuorumCnxManager {
         public static InitialMessage parse(Long protocolVersion, DataInputStream din) throws InitialMessageException, IOException {
             Long sid;
 
+            // 如果连入的server的zk协议版本不同，则直接抛异常
             if (protocolVersion != PROTOCOL_VERSION_V1 && protocolVersion != PROTOCOL_VERSION_V2) {
                 throw new InitialMessageException("Got unrecognized protocol version %s", protocolVersion);
             }
 
+            // 读取第二段8个字节，作为连入server的id
             sid = din.readLong();
 
+            // 读取4个字节，作为连入server的地址data的长度
             int remaining = din.readInt();
+            // maxBuffer默认是2k，所以就要求server选举传递的
+            // 连入server地址data，不可大于2KB
+            // 否则抛异常
             if (remaining <= 0 || remaining > maxBuffer) {
                 throw new InitialMessageException("Unreasonable buffer length: %s", remaining);
             }
 
+            // 将data数据读入字节数组 b 中
             byte[] b = new byte[remaining];
             int num_read = din.read(b);
 
+            // 读入的字节数与data字节数不一致，抛出异常
             if (num_read != remaining) {
                 throw new InitialMessageException("Read only %s bytes out of %s sent by server %s", num_read, remaining, sid);
             }
+
+            // 原版：目前这里的代码只支持IPV4；最新版变更：也支持ipv6了
+            // 解析 b 为连入server的地址(host + port)
+            // 连入server的port为选举端口
 
             // in PROTOCOL_VERSION_V1 we expect to get a single address here represented as a 'host:port' string
             // in PROTOCOL_VERSION_V2 we expect to get multiple addresses like: 'host1:port1|host2:port2|...'
@@ -271,10 +283,12 @@ public class QuorumCnxManager {
                     throw new InitialMessageException("Badly formed address: %s", addr);
                 }
 
+                // 拆分连入server端口（选举端口）
                 int port;
                 try {
                     port = Integer.parseInt(host_port[1]);
                 } catch (NumberFormatException e) {
+                    // 端口数值转换错误，抛异常
                     throw new InitialMessageException("Bad port number: %s", host_port[1]);
                 } catch (ArrayIndexOutOfBoundsException e) {
                     throw new InitialMessageException("No port number in: %s", addr);
@@ -480,6 +494,7 @@ public class QuorumCnxManager {
             // feature is enabled. During rolling upgrade, we must make sure that all the servers can
             // understand the protocol version we use to avoid multiple partitions. see ZOOKEEPER-3720
             long protocolVersion = self.isMultiAddressEnabled() ? PROTOCOL_VERSION_V2 : PROTOCOL_VERSION_V1;
+            // 先向输出流写入协议版本与当前server的sid等信息，此为challenge信息
             dout.writeLong(protocolVersion);
             dout.writeLong(self.getId());
 
@@ -497,6 +512,7 @@ public class QuorumCnxManager {
 
             din = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
         } catch (IOException e) {
+            // 由消息接收方通过challenge信息拒绝了连接，关闭连接
             LOG.warn("Ignoring exception reading or writing challenge: ", e);
             closeSocket(sock);
             return false;
@@ -510,6 +526,8 @@ public class QuorumCnxManager {
         }
 
         // If lost the challenge, then drop the new connection
+        // 这里与监听连入请求的判断相反，只去连接比自己的sid小的server，以此保证连接的顺序性
+        // 这里也是challenge的一部分
         if (sid > self.getId()) {
             LOG.info("Have smaller server identifier, so dropping the connection: (myId:{} --> sid:{})", self.getId(), sid);
             closeSocket(sock);
@@ -522,6 +540,7 @@ public class QuorumCnxManager {
 
             SendWorker vsw = senderWorkerMap.get(sid);
 
+            // 关闭已有的
             if (vsw != null) {
                 vsw.finish();
             }
@@ -599,13 +618,19 @@ public class QuorumCnxManager {
         MultipleAddresses electionAddr = null;
 
         try {
+            // 读取连入数据流的前8字节，并经处理后，可能是连入server的id或者是协议版本
+            // 8B 协议版本
             protocolVersion = din.readLong();
             if (protocolVersion >= 0) { // this is a server id and not a protocol version
                 sid = protocolVersion;
             } else {
+                // 当前zk版本，是走这里
                 try {
+                    // 根据协议版本，解析连入数据流，返回初始化数据
+                    // 解析出连入server的host和port
                     InitialMessage init = InitialMessage.parse(protocolVersion, din);
                     sid = init.sid;
+                    // 连入server的选举地址(host+port)
                     if (!init.electionAddr.isEmpty()) {
                         electionAddr = new MultipleAddresses(init.electionAddr,
                                 Duration.ofMillis(self.getMultiAddressReachabilityCheckTimeoutMs()));
@@ -613,34 +638,44 @@ public class QuorumCnxManager {
                     LOG.debug("Initial message parsed by {}: {}", self.getId(), init.toString());
                 } catch (InitialMessage.InitialMessageException ex) {
                     LOG.error("Initial message parsing error!", ex);
+                    LOG.info("QuorumCnxManager.handleConnection 获取init消息失败,关闭了连接, ip:port [{}:{}]", sock.getInetAddress(),
+                            sock.getPort());
                     closeSocket(sock);
                     return;
                 }
             }
 
+            // 如果是观察者，那么server连入请求中其server id应该是观察者默认sid
             if (sid == QuorumPeer.OBSERVER_ID) {
                 /*
                  * Choose identifier at random. We need a value to identify
                  * the connection.
+                 * 为这个连入的观察者，随机分配一个sid
                  */
                 sid = observerCounter.getAndDecrement();
                 LOG.info("Setting arbitrary identifier to observer: {}", sid);
             }
         } catch (IOException e) {
             LOG.warn("Exception reading or writing challenge", e);
+            LOG.info("QuorumCnxManager.handleConnection 没有输入流,关闭了连接, ip:port [{}:{}]", sock.getInetAddress(),
+                    sock.getPort());
+            // 处理连入请求数据流异常，关闭连接
             closeSocket(sock);
             return;
         }
 
         // do authenticating learner
+        // 默认没有session管理，这里无处理
         authServer.authenticate(sock, din);
         //If wins the challenge, then close the new connection.
+        // 如果当前server win (即sid大于连入的server的sid，就会关闭连接)
         if (sid < self.getId()) {
             /*
              * This replica might still believe that the connection to sid is
              * up, so we have to shut down the workers before trying to open a
              * new connection.
              */
+            // 关闭发送worker map中，这个连入server的发送worker线程
             SendWorker sw = senderWorkerMap.get(sid);
             if (sw != null) {
                 sw.finish();
@@ -650,8 +685,10 @@ public class QuorumCnxManager {
              * Now we start a new connection
              */
             LOG.debug("Create new connection to server: {}", sid);
+            // 关闭这个小的sid的server的连入请求
             closeSocket(sock);
 
+            // 由当前server去连接这个小的sid的server的选举地址
             if (electionAddr != null) {
                 connectOne(sid, electionAddr);
             } else {
@@ -663,20 +700,26 @@ public class QuorumCnxManager {
             LOG.warn("We got a connection request from a server with our own ID. "
                      + "This should be either a configuration error, or a bug.");
         } else { // Otherwise start worker threads to receive data.
+            // 当前server的sid较小，那么就接受这个连接（这里与发起连接的判断逻辑相反，保证了顺序性）
+            // 建立新的发送和接收的worker线程，用于处理与这个连入server的消息收发
             SendWorker sw = new SendWorker(sock, sid);
             RecvWorker rw = new RecvWorker(sock, din, sid, sw);
             sw.setRecv(rw);
 
+            // 将原有的发送worker线程关闭
             SendWorker vsw = senderWorkerMap.get(sid);
 
             if (vsw != null) {
                 vsw.finish();
             }
 
+            // 将最新的发送worker放入map中
             senderWorkerMap.put(sid, sw);
 
+            // 建立消息发送的消息阻塞队列
             queueSendMap.putIfAbsent(sid, new CircularBlockingQueue<>(SEND_CAPACITY));
 
+            // 启动收发消息线程
             sw.start();
             rw.start();
         }
@@ -1065,13 +1108,17 @@ public class QuorumCnxManager {
                 int numRetries = 0;
                 Socket client = null;
 
+                // portBindMaxRetry 端口绑定重试次数，默认最多3次(绑定当前server的选举端口)
                 while ((!shutdown) && (portBindMaxRetry == 0 || numRetries < portBindMaxRetry)) {
                     try {
                         serverSocket = createNewServerSocket();
                         LOG.info("{} is accepting connections now, my election bind port: {}", QuorumCnxManager.this.mySid, address.toString());
                         while (!shutdown) {
                             try {
+                                // 接收ss的数据流(以文件流格式数据接收)
+                                // 就是开启了对本地选举端口的数据监听(分配一个本地端口连接选举端口)
                                 client = serverSocket.accept();
+                                // 设置连接超时时间等
                                 setSockOpts(client);
                                 LOG.info("Received connection request from {}", client.getRemoteSocketAddress());
                                 // Receive and handle the connection request
@@ -1082,6 +1129,7 @@ public class QuorumCnxManager {
                                 if (quorumSaslAuthEnabled) {
                                     receiveConnectionAsync(client);
                                 } else {
+                                    // 接收选举端口的连入请求
                                     receiveConnection(client);
                                 }
                                 numRetries = 0;
@@ -1133,11 +1181,16 @@ public class QuorumCnxManager {
                     LOG.info("Creating TLS-only quorum server socket");
                     socket = new UnifiedServerSocket(self.getX509Util(), false);
                 } else {
+                    // 当前会走这里
                     socket = new ServerSocket();
                 }
 
+                // tcp连接关闭的一段时间内，会保持连接状态
                 socket.setReuseAddress(true);
+                // 默认不监听所有ip的连接请求
                 address = new InetSocketAddress(address.getHostString(), address.getPort());
+                // 将serverSocket绑定到获取到的选举address与port上
+                // 管理选举端口的连入请求
                 socket.bind(address);
 
                 return socket;

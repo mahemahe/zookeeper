@@ -102,6 +102,7 @@ public class QuorumPeerConfig {
 
     protected long serverId = UNSET_SERVERID;
 
+    // 存储参与选举的server list、观察server list，half数值等，如果不分组的配置，则由 QuorumMaj 对象实现
     protected QuorumVerifier quorumVerifier = null, lastSeenQuorumVerifier = null;
     protected int snapRetainCount = 3;
     protected int purgeInterval = 0;
